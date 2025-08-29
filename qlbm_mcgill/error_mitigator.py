@@ -69,16 +69,6 @@ class PECConfig:
             'noise_level': 0.008,
             'max_samples': 8000,
             'preferred_samples': 4000
-        },
-        'ibm_kyiv': {
-            'noise_level': 0.012,
-            'max_samples': 6000,
-            'preferred_samples': 3000
-        },
-        'ibm_sherbrooke': {
-            'noise_level': 0.007,
-            'max_samples': 10000,
-            'preferred_samples': 5000
         }
     }
     
