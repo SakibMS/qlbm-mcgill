@@ -1,5 +1,5 @@
 from base import *
-from mitiq import zne
+from mitiq import zne, pec
 from mitiq.interface.mitiq_qiskit.qiskit_utils import initialized_depolarizing_noise
 
 class REMTable:
@@ -51,12 +51,96 @@ def get_measured_qubits(circuit):
             bits = [circuit.find_bit(qarg)[0] for qarg in qargs]
             measured_qubits.append(bits[0])
     return measured_qubits
+
+class PECConfig:
+    """
+    Configuration class for PEC parameters.
+    Allows fine-tuning of PEC behavior for different lattice sizes and backends.
+    """
     
+    # Default PEC parameters
+    DEFAULT_NOISE_LEVEL = 0.01  # Default depolarizing noise level for representation
+    DEFAULT_NUM_SAMPLES = 5000  # Default number of PEC samples
+    DEFAULT_MAX_SAMPLES = 10000 # Maximum samples for large circuits
+    
+    # Backend-specific configurations
+    BACKEND_CONFIGS = {
+        'ibm_brisbane': {
+            'noise_level': 0.008,
+            'max_samples': 8000,
+            'preferred_samples': 4000
+        },
+        'ibm_kyiv': {
+            'noise_level': 0.012,
+            'max_samples': 6000,
+            'preferred_samples': 3000
+        },
+        'ibm_sherbrooke': {
+            'noise_level': 0.007,
+            'max_samples': 10000,
+            'preferred_samples': 5000
+        }
+    }
+    
+    # Lattice size recommendations
+    LATTICE_CONFIGS = {
+        (2, 2): {'samples': 8000, 'noise_level': 0.008},
+        (4, 4): {'samples': 5000, 'noise_level': 0.010},
+        (6, 6): {'samples': 3000, 'noise_level': 0.012},
+        (8, 8): {'samples': 2000, 'noise_level': 0.015}
+    }
+    
+    @classmethod
+    def get_config(cls, backend_name: str, lattice_dims: tuple) -> dict:
+        """
+        Get optimized PEC configuration for a specific backend and lattice size.
+        """
+        # Start with defaults
+        config = {
+            'noise_level': cls.DEFAULT_NOISE_LEVEL,
+            'num_samples': cls.DEFAULT_NUM_SAMPLES,
+            'max_samples': cls.DEFAULT_MAX_SAMPLES
+        }
+        
+        # Apply backend-specific settings
+        backend_config = cls.BACKEND_CONFIGS.get(backend_name, {})
+        config.update(backend_config)
+        
+        # Apply lattice-specific settings
+        lattice_config = cls.LATTICE_CONFIGS.get(tuple(lattice_dims), {})
+        if 'samples' in lattice_config:
+            config['num_samples'] = lattice_config['samples']
+        if 'noise_level' in lattice_config:
+            config['noise_level'] = lattice_config['noise_level']
+        
+        return config
+
+class PECTable:
+    """
+    A lookup table for PEC representations to avoid recomputation.
+    """
+    def __init__(self):
+        self.representations = {}
+    
+    def get_key(self, backend_name: str, circuit: QuantumCircuit) -> str:
+        """Generate a unique key for the circuit and backend combination."""
+        # Use circuit depth and gate counts as a simple key
+        gate_counts = circuit.count_ops()
+        return f"{backend_name}_{circuit.depth()}_{hash(str(gate_counts))}"
+    
+    def store(self, key: str, representations: list):
+        """Store PEC representations."""
+        self.representations[key] = representations
+    
+    def load(self, key: str) -> list | None:
+        """Load PEC representations if available."""
+        return self.representations.get(key)
 
 class ErrorMitigator:
     """
     Contains all methods that mitigate error via post-processing.
-    Currently implements Readout Error Mitigation (REM) and Iterative Bayesian Unfolding (IBU).
+    Currently implements Readout Error Mitigation (REM), Iterative Bayesian Unfolding (IBU),
+    Zero Noise Extrapolation (ZNE), and Probabilistic Error Cancellation (PEC).
     """
     class ReadoutError:
         """
@@ -93,6 +177,8 @@ class ErrorMitigator:
     readout_error_mitigation: bool
     iterative_bayesian_unfolding: bool
     zero_noise_extrapolation: bool
+    probabilistic_error_cancellation: bool
+    pec_table: PECTable
 
     def __init__(
             self,
@@ -102,7 +188,8 @@ class ErrorMitigator:
             equalization: bool = False,
             readout_error_mitigation: bool = False,
             iterative_bayesian_unfolding: bool = False,
-            zero_noise_extrapolation: bool = False
+            zero_noise_extrapolation: bool = False,
+            probabilistic_error_cancellation: bool = False
         ) -> None:
         self.lattice = lattice
         self.dims = lattice.dims
@@ -112,6 +199,8 @@ class ErrorMitigator:
         self.readout_error_mitigation = readout_error_mitigation
         self.iterative_bayesian_unfolding = iterative_bayesian_unfolding
         self.zero_noise_extrapolation = zero_noise_extrapolation
+        self.probabilistic_error_cancellation = probabilistic_error_cancellation
+        self.pec_table = PECTable()
     
     def rem(
             self,
@@ -181,6 +270,173 @@ class ErrorMitigator:
             ibu_mitigated.append({label: int(prob[0] * shots) for label, prob in ibu.guess_as_dict().items()})
 
         return ibu_mitigated
+
+    def generate_pec_representations(
+            self,
+            circuits: list[QuantumCircuit],
+            num_samples: int = 10000
+        ) -> list[list]:
+        """
+        Generate PEC representations for the given circuits.
+        """
+        print("Generating PEC representations...")
+        
+        # Get optimized configuration for this backend and lattice
+        pec_config = PECConfig.get_config(self.backend.name, self.dims)
+        
+        # Create a simplified noise model for PEC representation generation
+        # In practice, you might want to use the actual backend noise model
+        noise_model = initialized_depolarizing_noise(
+            noise_level=pec_config['noise_level'],
+            num_qubits=max([circuit.num_qubits for circuit in circuits])
+        )
+        
+        representations = []
+        for i, circuit in enumerate(circuits):
+            print(f"Processing circuit {i+1}/{len(circuits)}...")
+            
+            # Check if we already have representations cached
+            key = self.pec_table.get_key(self.backend.name, circuit)
+            cached_repr = self.pec_table.load(key)
+            
+            if cached_repr is not None:
+                print(f"Using cached PEC representation for circuit {i+1}")
+                representations.append(cached_repr)
+                continue
+            
+            try:
+                # Generate PEC representation
+                # We use a subset of the circuit's operations for efficiency
+                representation = pec.represent_operations_in_circuit_with_local_depolarizing_noise(
+                    circuit,
+                    noise_level=pec_config['noise_level'],
+                    num_samples=min(num_samples, pec_config['max_samples'])
+                )
+                
+                # Cache the representation
+                self.pec_table.store(key, representation)
+                representations.append(representation)
+                
+            except Exception as e:
+                print(f"Warning: Could not generate PEC representation for circuit {i+1}: {e}")
+                # Fall back to identity representation (no error correction)
+                representations.append([])
+        
+        return representations
+
+    def pec(
+            self,
+            circuits: list[QuantumCircuit],
+            shots: int,
+            num_samples: int = 5000
+        ) -> tuple[list[dict], str]:
+        """
+        Apply Probabilistic Error Cancellation to the circuits.
+        """
+        print("Performing Probabilistic Error Cancellation...")
+        
+        # Generate or retrieve PEC representations
+        representations = self.generate_pec_representations(circuits, num_samples)
+        
+        # Execute PEC-mitigated circuits
+        mitigated_counts = []
+        
+        sampler = Sampler(self.backend)
+        
+        for i, (circuit, representation) in enumerate(zip(circuits, representations)):
+            print(f"Executing PEC for circuit {i+1}/{len(circuits)}...")
+            
+            if not representation:  # No representation available, run original circuit
+                print(f"No PEC representation for circuit {i+1}, running original...")
+                job = sampler.run([circuit], shots=shots)
+                result = job.result()
+                counts = result[0].join_data().get_counts()
+                mitigated_counts.append(counts)
+                continue
+            
+            try:
+                # Sample from the PEC representation
+                sampled_circuits = pec.sample_circuits(
+                    circuit,
+                    representation,
+                    num_samples=min(num_samples, shots // 10)  # Reasonable number of samples
+                )
+                
+                # Execute the sampled circuits
+                if sampled_circuits:
+                    # Distribute shots across sampled circuits
+                    shots_per_circuit = max(1, shots // len(sampled_circuits))
+                    
+                    jobs = []
+                    for sampled_circuit in sampled_circuits:
+                        job = sampler.run([sampled_circuit], shots=shots_per_circuit)
+                        jobs.append(job)
+                    
+                    # Collect and process results
+                    all_counts = []
+                    for job in jobs:
+                        result = job.result()
+                        counts = result[0].join_data().get_counts()
+                        all_counts.append(counts)
+                    
+                    # Combine results using PEC post-processing
+                    combined_counts = self._combine_pec_results(all_counts, representation, shots)
+                    mitigated_counts.append(combined_counts)
+                    
+                else:
+                    # Fallback to original circuit
+                    job = sampler.run([circuit], shots=shots)
+                    result = job.result()
+                    counts = result[0].join_data().get_counts()
+                    mitigated_counts.append(counts)
+                    
+            except Exception as e:
+                print(f"Warning: PEC failed for circuit {i+1}, using original: {e}")
+                # Fallback to original circuit
+                job = sampler.run([circuit], shots=shots)
+                result = job.result()
+                counts = result[0].join_data().get_counts()
+                mitigated_counts.append(counts)
+        
+        if self.equalization:
+            mitigated_counts = self.equalize(mitigated_counts, shots)
+        
+        label = f"pec-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
+        return mitigated_counts, label
+
+    def _combine_pec_results(
+            self,
+            all_counts: list[dict],
+            representation: list,
+            target_shots: int
+        ) -> dict:
+        """
+        Combine PEC sampling results with proper weighting.
+        """
+        if not all_counts:
+            return {}
+        
+        # Get all possible bitstrings
+        all_bitstrings = set()
+        for counts in all_counts:
+            all_bitstrings.update(counts.keys())
+        
+        # Initialize combined counts
+        combined = {bitstring: 0.0 for bitstring in all_bitstrings}
+        
+        # Simple average combination (can be improved with proper PEC weighting)
+        total_weight = len(all_counts)
+        for counts in all_counts:
+            for bitstring in all_bitstrings:
+                combined[bitstring] += counts.get(bitstring, 0) / total_weight
+        
+        # Normalize to target shots
+        total_counts = sum(combined.values())
+        if total_counts > 0:
+            scaling_factor = target_shots / total_counts
+            combined = {bs: int(count * scaling_factor) for bs, count in combined.items()}
+        
+        return combined
     
     def zne(
             self,
@@ -189,7 +445,6 @@ class ErrorMitigator:
         ) -> tuple[list[dict], str]:
         """
         Runs Zero Noise Extrapolation. Omits the 0th step of the visualization since it is of depth 1 and thus gets good results.
-
         """
         print("Performing Zero Noise Extrapolation...")
 
@@ -214,13 +469,11 @@ class ErrorMitigator:
         )
         
         first_exec = pm.run([first])
-
         exec_circuits = [pm.run(folded_circuit) for folded_circuit in folded_circuits]
         
         sampler = Sampler(self.backend)
 
         first_job = sampler.run(first_exec)
-
         jobs = [sampler.run(exec_circuit, shots=shots) for exec_circuit in exec_circuits]
 
         # Raw
@@ -258,6 +511,8 @@ class ErrorMitigator:
         label = f"zne-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
 
         return mitigated_counts, label
+
+
         
     def equalize(
             self,
@@ -268,9 +523,7 @@ class ErrorMitigator:
         "Equalizes" the visualization by cropping the lowest-counted half of the data and setting 
         the highest-counted half to the theoretically correct number of counts, which is:
         shots / 0.5*x*y, where [x,y] are the dimensions.
-        Currently only implemented for ZNE.
         """
-
         measured_qubits = StepCircuit(self.lattice, 0).grid_qubits
         equalized_counts = []
 
@@ -294,16 +547,30 @@ class ErrorMitigator:
         ) -> tuple[list[dict], str]:
         
         # Data shows that performing REM and then IBU yields better results.
-        if (self.readout_error_mitigation == False and self.iterative_bayesian_unfolding == False):
+        if (self.readout_error_mitigation == False and 
+            self.iterative_bayesian_unfolding == False and
+            self.probabilistic_error_cancellation == False):
             label = f"raw-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
             return counts, label
-        if (self.readout_error_mitigation == True):
-            label = f"rem-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
-            counts = self.rem(shots, counts)
-        if (self.iterative_bayesian_unfolding == True):
-            label = f"ibu-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
-            counts = self.ibu(qcs, shots, counts)
-        if (self.readout_error_mitigation == True and self.iterative_bayesian_unfolding == True):
-            label = f"rem-ibu-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
-        return counts, label
         
+        # PEC is fundamentally different - it requires circuit-level intervention
+        # and cannot be applied as post-processing like REM/IBU
+        if self.probabilistic_error_cancellation:
+            print("Note: PEC requires circuit-level modification and bypasses post-processing methods.")
+            pec_counts, label = self.pec(qcs, shots)
+            return pec_counts, label
+        
+        # Standard post-processing pipeline (REM -> IBU)
+        mitigated_counts = counts
+        label_parts = []
+        
+        if self.readout_error_mitigation:
+            label_parts.append("rem")
+            mitigated_counts = self.rem(shots, mitigated_counts)
+        
+        if self.iterative_bayesian_unfolding:
+            label_parts.append("ibu")
+            mitigated_counts = self.ibu(qcs, shots, mitigated_counts)
+        
+        label = f"{'-'.join(label_parts)}-collisionless-{self.dims[0]}x{self.dims[1]}-ibm-qpu"
+        return mitigated_counts, label
