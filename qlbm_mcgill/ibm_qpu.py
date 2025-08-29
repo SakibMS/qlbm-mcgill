@@ -30,6 +30,7 @@ class IBM_QPU_Runner(Runner):
             readout_error_mitigation: bool = False,
             iterative_bayesian_unfolding: bool = False,
             zero_noise_extrapolation: bool = False,
+            probabilistic_error_cancellation: bool = False,
             equalization: bool = False
         ) -> None:
         
@@ -47,6 +48,7 @@ class IBM_QPU_Runner(Runner):
             readout_error_mitigation=readout_error_mitigation,
             iterative_bayesian_unfolding=iterative_bayesian_unfolding,
             zero_noise_extrapolation=zero_noise_extrapolation,
+            probabilistic_error_cancellation=probabilistic_error_cancellation,
             equalization=equalization
         )
         
@@ -65,6 +67,14 @@ class IBM_QPU_Runner(Runner):
 
         if self.error_mitigator.zero_noise_extrapolation:
             counts, self.label = self.error_mitigator.zne(shots, steps=steps)
+            return counts
+        elif self.error_mitigator.probabilistic_error_cancellation:
+            # PEC execution path
+            step_qcs = [StepCircuit(self.lattice, i, collision=False, init_cond=init_cond).circuit for i in range(steps+1)]
+            pass_manager = generate_preset_pass_manager(optimization_level=1, backend=self.backend)
+            self.transpiled_circuits = [pass_manager.run(qc) for qc in step_qcs]
+            
+            counts, self.label = self.error_mitigator.pec(self.transpiled_circuits, shots)
             return counts
         else:
 
@@ -109,7 +119,8 @@ class IBM_QPU_Runner(Runner):
         
         print("Creating visualization... ")
         
-        if self.error_mitigator.zero_noise_extrapolation == False:
+        if (self.error_mitigator.zero_noise_extrapolation == False and 
+            self.error_mitigator.probabilistic_error_cancellation == False):
 
             # IBU needs the transpiled circuits from the backend
             if (job_id != None):
@@ -140,7 +151,8 @@ class IBM_QPU_Runner(Runner):
         """
         Runs and visualizes the lattice.
         """
-        if self.error_mitigator.zero_noise_extrapolation:
+        if (self.error_mitigator.zero_noise_extrapolation or 
+            self.error_mitigator.probabilistic_error_cancellation):
             counts = self.run(steps, shots=shots, init_cond=init_cond)
             vis = self.visualize(steps, shots=shots, counts=counts)
             return vis
